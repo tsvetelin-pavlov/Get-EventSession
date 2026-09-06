@@ -797,8 +797,17 @@ function Set-VideoMetadata {
         return
     }
 
+    if (-not $script:MetadataTimeoutSeconds) {
+        $script:MetadataTimeoutSeconds = 900
+    }
+
+    $originalItem = Get-Item -LiteralPath $File
+    $creationTime = $originalItem.CreationTime
+    $lastWriteTime = $originalItem.LastWriteTime
     $outputFile = '{0}.{1}.metadata{2}' -f [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($File), [System.IO.Path]::GetFileNameWithoutExtension($File)), (New-Guid).Guid, [System.IO.Path]::GetExtension($File)
-    $arguments = @('-y', '-i', $File, '-map', '0', '-c', 'copy')
+    # -nostdin stops ffmpeg from consuming the console input handle, and the quiet logging
+    # options keep the redirected stderr pipe from filling up while remuxing large files.
+    $arguments = @('-nostdin', '-hide_banner', '-loglevel', 'error', '-nostats', '-y', '-i', $File, '-map', '0', '-c', 'copy')
 
     # Only tags the MP4 muxer maps to standard atoms are stored; custom keys are silently
     # dropped by ffmpeg, and 'use_metadata_tags' would make every tag unreadable to Windows.
@@ -839,12 +848,27 @@ function Set-VideoMetadata {
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $pinfo
     $process.Start() | Out-Null
-    $stdout = $process.StandardOutput.ReadToEnd()
-    $stderr = $process.StandardError.ReadToEnd()
-    $process.WaitForExit()
+
+    # Drain both pipes concurrently; reading one to the end before the other deadlocks as soon
+    # as ffmpeg fills the buffer of the pipe that is not being read.
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+
+    if (-not $process.WaitForExit( $script:MetadataTimeoutSeconds * 1000)) {
+        Write-Warning ('Timed out writing video metadata for {0} after {1} seconds' -f $File, $script:MetadataTimeoutSeconds)
+        try { $process.Kill() } catch {}
+        try { $process.WaitForExit( 5000) | Out-Null } catch {}
+        Remove-Item -LiteralPath $outputFile -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
 
     if ($process.ExitCode -eq 0 -and (Test-Path -LiteralPath $outputFile) -and (Get-Item -LiteralPath $outputFile).Length -gt 0) {
         Move-Item -LiteralPath $outputFile -Destination $File -Force
+        [System.IO.File]::SetCreationTime($File, $creationTime)
+        [System.IO.File]::SetLastWriteTime($File, $lastWriteTime)
         Write-Verbose ('Video metadata written to {0}' -f $File)
     }
     else {
