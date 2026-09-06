@@ -635,8 +635,11 @@ function Get-SessionPresentationUrl {
         return [string]$presentationUrl
     }
 
-    if ($FallbackSlidedeckUrl -and $Session.PSObject.Properties.Match('sessionCode').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$Session.sessionCode)) {
-        return ($FallbackSlidedeckUrl -f $Session.sessionCode)
+    $sessionCode = Get-ObjectPropertyValue -Object $Session -Name @('sessionCode', 'scheduleCode', 'code')
+    if ($FallbackSlidedeckUrl -and $sessionCode) {
+        # The fallback is a template for most events but is a scraped URL for custom events, so
+        # substitute the placeholder literally: -f would throw on a URL containing other braces.
+        return $FallbackSlidedeckUrl.Replace('{0}', [string]$sessionCode)
     }
 
     return $null
