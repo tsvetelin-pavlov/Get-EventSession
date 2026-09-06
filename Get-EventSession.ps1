@@ -4593,6 +4593,78 @@ function Resolve-CaptionSourceByPreferredLanguage {
     return $null
 }
 
+function ConvertTo-CaptionLanguageTag {
+    # Normalizes a caption language such as 'bg-BG' or 'bg_bg' to the ISO 639 subtag 'bg'.
+    # Media players (Plex, Jellyfin, Kodi) match subtitle languages on that subtag, so the
+    # region part is dropped to keep the resulting file name recognizable to them.
+    param(
+        [AllowNull()][string]$Language
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Language)) {
+        return $null
+    }
+
+    $tag = $Language.Trim().Replace('_', '-').ToLowerInvariant().Split('-')[0]
+
+    if ($tag -notmatch '^[a-z]{2,3}$') {
+        return $null
+    }
+
+    return $tag
+}
+
+function Add-CaptionLanguageToFileName {
+    # Inserts the language subtag before the extension, eg 'Session.vtt' becomes 'Session.bg.vtt'.
+    param(
+        [parameter(Mandatory = $true)][string]$Path,
+        [AllowNull()][string]$LanguageTag
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LanguageTag)) {
+        return $Path
+    }
+
+    $extension = [System.IO.Path]::GetExtension($Path)
+    $withoutExtension = $Path.Substring(0, $Path.Length - $extension.Length)
+
+    if ($withoutExtension -match ('(?i)\.{0}$' -f [regex]::Escape($LanguageTag))) {
+        return $Path
+    }
+
+    return '{0}.{1}{2}' -f $withoutExtension, $LanguageTag, $extension
+}
+
+function Get-ExistingCaptionFile {
+    # Returns a previously downloaded caption for this session, taking into account that it
+    # may carry a language subtag which is unknown until the caption source is resolved.
+    param(
+        [parameter(Mandatory = $true)][string]$Path
+    )
+
+    if (Test-Path -LiteralPath $Path) {
+        return $Path
+    }
+
+    $directory = [System.IO.Path]::GetDirectoryName($Path)
+    if ([string]::IsNullOrWhiteSpace($directory) -or -not (Test-Path -LiteralPath $directory)) {
+        return $null
+    }
+
+    $extension = [System.IO.Path]::GetExtension($Path)
+    $fileName = [System.IO.Path]::GetFileName($Path)
+    $baseName = $fileName.Substring(0, $fileName.Length - $extension.Length)
+
+    # -Filter is used rather than -Path so that characters like [ ] in session titles are
+    # not interpreted as PowerShell wildcards.
+    $existing = @(Get-ChildItem -LiteralPath $directory -Filter ('{0}.*{1}' -f $baseName, $extension) -File -ErrorAction SilentlyContinue)
+    if ($existing.Count -gt 0) {
+        return $existing[0].FullName
+    }
+
+    return $null
+}
+
 function Clean-VideoLeftovers ( $videofile) {
     $masks = '.*.mp4.part', '.*.mp4.ytdl'
     foreach ( $mask in $masks) {
@@ -6230,9 +6302,10 @@ foreach ($SessionToGet in $SessionsToGet) {
                         Write-Verbose 'Caption extension was not set; defaulting to vtt'
                     }
                     $captionExtFile = $vidFullFile -replace '.mp4', ('.{0}' -f $CaptionExt)
+                    $existingCaptionFile = Get-ExistingCaptionFile -Path $captionExtFile
 
-                    if ((Test-Path -LiteralPath $captionExtFile) -and -not $Overwrite) {
-                        Write-Host ('Caption file exists {0}' -f $captionExtFile) -ForegroundColor Gray
+                    if ($existingCaptionFile -and -not $Overwrite) {
+                        Write-Host ('Caption file exists {0}' -f $existingCaptionFile) -ForegroundColor Gray
                     }
                     else {
                         $captionInfoSourceUrl = $SessionToGet.onDemand
@@ -6306,6 +6379,13 @@ foreach ($SessionToGet in $SessionsToGet) {
                             }
                         }
                         if ( $captionFileLink) {
+                            if (-not $captionLanguageSelected) {
+                                $captionLanguageSelected = [string](Get-ObjectPropertyValue -Object $SessionToGet -Name @('captionLanguage'))
+                            }
+                            if (-not $captionLanguageSelected -and $captionFileLink -match '(?i)Caption_(?<lang>[a-z]{2,3}([-_][a-z0-9]{2,4})?)\.') {
+                                $captionLanguageSelected = $Matches.lang
+                            }
+
                             if ($captionLanguageSelected) {
                                 Write-Verbose ('Selected caption language {0} for session {1}' -f $captionLanguageSelected, $SessionToGet.sessioncode)
                             }
@@ -6314,16 +6394,27 @@ foreach ($SessionToGet in $SessionsToGet) {
                             }
                             Write-Verbose ('Retrieving caption file from URL {0}' -f $captionFileLink)
 
-                            $captionFullFile = $captionExtFile
-                            Write-Verbose ('Attempting download {0} to {1}' -f $captionFileLink, $captionFullFile)
-                            $captionNeedsAuthDownload = (Test-IsProtectedContentUrl -Url $captionFileLink)
-                            $captionAuthHeaders = $null
-                            if ($captionNeedsAuthDownload) {
-                                Write-Verbose ('Caption file requires authenticated download for session {0}' -f $SessionToGet.sessioncode)
-                                $captionAuthHeaders = Get-MSADownloadAuthHeaders -Url $captionFileLink -Proxy $ProxyURL
+                            # Suffix the file with the language subtag, eg Session.bg.vtt, so media
+                            # players can determine the subtitle language from the file name.
+                            $captionLanguageTag = ConvertTo-CaptionLanguageTag -Language $captionLanguageSelected
+                            if (-not $captionLanguageTag) {
+                                Write-Verbose ('No usable caption language subtag for session {0}; saving captions without language suffix' -f $SessionToGet.sessioncode)
                             }
-                            Add-BackgroundDownloadJob -Type 3 -FilePath $captionExtFile -DownloadUrl $captionFileLink -File $captionFullFile -Timestamp $SessionTime -scheduleCode ($SessionToGet.sessioncode) -Title ($SessionToGet.Title) -Headers $captionAuthHeaders -Proxy $ProxyURL
+                            $captionFullFile = Add-CaptionLanguageToFileName -Path $captionExtFile -LanguageTag $captionLanguageTag
 
+                            if ((Test-Path -LiteralPath $captionFullFile) -and -not $Overwrite) {
+                                Write-Host ('Caption file exists {0}' -f $captionFullFile) -ForegroundColor Gray
+                            }
+                            else {
+                                Write-Verbose ('Attempting download {0} to {1}' -f $captionFileLink, $captionFullFile)
+                                $captionNeedsAuthDownload = (Test-IsProtectedContentUrl -Url $captionFileLink)
+                                $captionAuthHeaders = $null
+                                if ($captionNeedsAuthDownload) {
+                                    Write-Verbose ('Caption file requires authenticated download for session {0}' -f $SessionToGet.sessioncode)
+                                    $captionAuthHeaders = Get-MSADownloadAuthHeaders -Url $captionFileLink -Proxy $ProxyURL
+                                }
+                                Add-BackgroundDownloadJob -Type 3 -FilePath $captionFullFile -DownloadUrl $captionFileLink -File $captionFullFile -Timestamp $SessionTime -scheduleCode ($SessionToGet.sessioncode) -Title ($SessionToGet.Title) -Headers $captionAuthHeaders -Proxy $ProxyURL
+                            }
                         }
                         else {
                             Write-Warning "Subtitles requested, but no Caption URL found"
