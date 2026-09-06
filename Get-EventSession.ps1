@@ -584,6 +584,40 @@ function Format-MetadataValueList {
     return (ConvertTo-MetadataValueList -Value $Value) -join '; '
 }
 
+function ConvertTo-SessionDateTime {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    if ($Value -is [datetime]) {
+        return $Value
+    }
+
+    $stringValue = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($stringValue)) {
+        return $null
+    }
+
+    # Catalogs publish US-style timestamps, which fail to parse under other cultures
+    $parsed = [datetime]::MinValue
+    $formats = [string[]]@('MM/dd/yyyy HH:mm:ss', 'M/d/yyyy H:mm:ss', 'MM/dd/yyyy', 'yyyy-MM-ddTHH:mm:ss', 'yyyy-MM-dd HH:mm:ss', 'yyyy-MM-dd', 'yyyyMMdd')
+    if ([datetime]::TryParseExact($stringValue, $formats, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+        return $parsed
+    }
+
+    if ([datetime]::TryParse($stringValue, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+        return $parsed
+    }
+
+    if ([datetime]::TryParse($stringValue, [System.Globalization.CultureInfo]::CurrentCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+        return $parsed
+    }
+
+    return $null
+}
+
 function Get-SessionPresentationUrl {
     param(
         [parameter(Mandatory = $true)][object]$Session,
@@ -710,11 +744,12 @@ function New-EventSessionVideoMetadata {
     $year = $null
     $startDateTime = Get-ObjectPropertyValue -Object $Session -Name @('startDateTime')
     if ($startDateTime) {
-        try {
-            $year = (Get-Date -Date $startDateTime).Year
+        $sessionDate = ConvertTo-SessionDateTime -Value $startDateTime
+        if ($sessionDate) {
+            $year = $sessionDate.Year
         }
-        catch {
-            Write-Verbose ('Unable to determine metadata year for {0}: {1}' -f $sessionCode, $_.Exception.Message)
+        else {
+            Write-Verbose ('Unable to determine metadata year for {0} from value {1}' -f $sessionCode, $startDateTime)
         }
     }
 
@@ -763,25 +798,24 @@ function Set-VideoMetadata {
     }
 
     $outputFile = '{0}.{1}.metadata{2}' -f [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($File), [System.IO.Path]::GetFileNameWithoutExtension($File)), (New-Guid).Guid, [System.IO.Path]::GetExtension($File)
-    $arguments = @('-y', '-i', $File, '-map', '0', '-c', 'copy', '-movflags', 'use_metadata_tags')
+    $arguments = @('-y', '-i', $File, '-map', '0', '-c', 'copy')
 
+    # Only tags the MP4 muxer maps to standard atoms are stored; custom keys are silently
+    # dropped by ffmpeg, and 'use_metadata_tags' would make every tag unreadable to Windows.
     $metadataMap = [ordered]@{
-        title         = $Metadata.Title
-        subtitle      = $Metadata.Subtitle
-        artist        = $Metadata.Artists
-        album_artist  = $Metadata.Artists
-        date          = $Metadata.Year
-        year          = $Metadata.Year
-        genre         = $Metadata.Genre
-        producer      = $Metadata.Producer
-        publisher     = $Metadata.Producer
-        comment       = $Metadata.Comments
-        description   = $Metadata.Comments
-        tags          = $Metadata.Tags
-        keywords      = $Metadata.Tags
-        purl          = $Metadata.PromotionUrl
-        promotion_url = $Metadata.PromotionUrl
-        url           = $Metadata.PromotionUrl
+        title        = $Metadata.Title
+        show         = $Metadata.Subtitle
+        episode_id   = $Metadata.Subtitle
+        artist       = $Metadata.Artists
+        album_artist = $Metadata.Artists
+        date         = $Metadata.Year
+        genre        = $Metadata.Genre
+        comment      = $Metadata.Comments
+        description  = $Metadata.Comments
+        synopsis     = $Metadata.Comments
+        keywords     = $Metadata.Tags
+        copyright    = $Metadata.Producer
+        network      = $Metadata.Producer
     }
 
     foreach ($metadataItem in $metadataMap.GetEnumerator()) {
