@@ -509,6 +509,252 @@ function Fix-FileName ($title) {
     return ($cleaned -replace ($invalidChars -join '|'), '')
 }
 
+function ConvertTo-ArgumentString {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return '""'
+    }
+
+    $stringValue = [string]$Value
+    $escapedValue = $stringValue -replace '(\\*)"', '$1$1\"'
+    $escapedValue = $escapedValue -replace '(\\+)$', '$1$1'
+    return '"{0}"' -f $escapedValue
+}
+
+function Get-ObjectPropertyValue {
+    param(
+        [parameter(Mandatory = $true)][object]$Object,
+        [parameter(Mandatory = $true)][string[]]$Name
+    )
+
+    foreach ($propertyName in $Name) {
+        if ($Object.PSObject.Properties.Match($propertyName).Count -gt 0) {
+            $value = $Object.$propertyName
+            if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+                return $value
+            }
+        }
+    }
+
+    return $null
+}
+
+function ConvertTo-MetadataValueList {
+    param([AllowNull()][object]$Value)
+
+    $items = [System.Collections.ArrayList]@()
+    if ($null -eq $Value) {
+        return @()
+    }
+
+    foreach ($entry in @($Value)) {
+        if ($null -eq $entry) {
+            continue
+        }
+
+        if ($entry -is [string]) {
+            foreach ($part in ($entry -split [char]9)) {
+                $candidate = $part.Trim()
+                if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                    $items.Add($candidate) | Out-Null
+                }
+            }
+            continue
+        }
+
+        $displayValue = Get-ObjectPropertyValue -Object $entry -Name @('displayValue', 'name', 'title', 'logicalValue')
+        if ($displayValue) {
+            $items.Add([string]$displayValue) | Out-Null
+        }
+        else {
+            $candidate = ([string]$entry).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                $items.Add($candidate) | Out-Null
+            }
+        }
+    }
+
+    return @($items | Select-Object -Unique)
+}
+
+function Format-MetadataValueList {
+    param([AllowNull()][object]$Value)
+
+    return (ConvertTo-MetadataValueList -Value $Value) -join '; '
+}
+
+function Get-SessionPresentationUrl {
+    param(
+        [parameter(Mandatory = $true)][object]$Session,
+        [AllowNull()][string]$FallbackSlidedeckUrl
+    )
+
+    $presentationUrl = Get-ObjectPropertyValue -Object $Session -Name @('slideDeck', 'slidedeck', 'presentationUrl')
+    if ($presentationUrl) {
+        return [string]$presentationUrl
+    }
+
+    if ($FallbackSlidedeckUrl -and $Session.PSObject.Properties.Match('sessionCode').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$Session.sessionCode)) {
+        return ($FallbackSlidedeckUrl -f $Session.sessionCode)
+    }
+
+    return $null
+}
+
+function Get-SessionOriginalVideoUrl {
+    param(
+        [parameter(Mandatory = $true)][object]$Session,
+        [AllowNull()][string]$EventName,
+        [AllowNull()][string]$FallbackVideoUrl
+    )
+
+    if ($EventName -like 'Build*') {
+        $localizedId = Get-ObjectPropertyValue -Object $Session -Name @('localizedId')
+        if ($localizedId) {
+            $locale = Get-ObjectPropertyValue -Object $Session -Name @('langLocale')
+            if (-not $locale) {
+                $locale = 'en-US'
+            }
+            return 'https://build.microsoft.com/{0}/sessions/{1}' -f $locale, $localizedId
+        }
+    }
+
+    $sessionUrl = Get-ObjectPropertyValue -Object $Session -Name @('onDemand', 'webpage_url', 'registrationLink')
+    if ($sessionUrl) {
+        return [string]$sessionUrl
+    }
+
+    return $FallbackVideoUrl
+}
+
+function New-EventSessionVideoMetadata {
+    param(
+        [parameter(Mandatory = $true)][object]$Session,
+        [AllowNull()][string]$EventName,
+        [AllowNull()][string]$OriginalVideoUrl,
+        [AllowNull()][string]$PresentationUrl
+    )
+
+    $description = Get-ObjectPropertyValue -Object $Session -Name @('description', 'aiDescription')
+    $sessionCode = Get-ObjectPropertyValue -Object $Session -Name @('sessionCode', 'scheduleCode', 'code')
+    $speakerNames = Format-MetadataValueList -Value (Get-ObjectPropertyValue -Object $Session -Name @('speakerNames', 'speakers'))
+    $tags = @()
+    foreach ($tagProperty in @('tags', 'products', 'contentCategory', 'solutionArea', 'topic', 'programmingLanguages', 'sessionType')) {
+        if ($Session.PSObject.Properties.Match($tagProperty).Count -gt 0) {
+            $tags += ConvertTo-MetadataValueList -Value $Session.$tagProperty
+        }
+    }
+
+    $year = $null
+    $startDateTime = Get-ObjectPropertyValue -Object $Session -Name @('startDateTime')
+    if ($startDateTime) {
+        try {
+            $year = (Get-Date -Date $startDateTime).Year
+        }
+        catch {
+            Write-Verbose ('Unable to determine metadata year for {0}: {1}' -f $sessionCode, $_.Exception.Message)
+        }
+    }
+
+    $commentLines = [System.Collections.ArrayList]@()
+    if ($description) {
+        $commentLines.Add(([string]$description).Trim()) | Out-Null
+        $commentLines.Add('') | Out-Null
+    }
+    if ($OriginalVideoUrl) {
+        $commentLines.Add(('Original video: {0}' -f $OriginalVideoUrl)) | Out-Null
+    }
+    if ($PresentationUrl) {
+        $commentLines.Add(('Presentation: {0}' -f $PresentationUrl)) | Out-Null
+    }
+
+    return [PSCustomObject]@{
+        Title           = [string](Get-ObjectPropertyValue -Object $Session -Name @('title'))
+        Subtitle        = [string]$sessionCode
+        Tags            = (($tags | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique) -join '; ')
+        Comments        = ($commentLines -join [System.Environment]::NewLine).Trim()
+        Artists         = $speakerNames
+        Year            = $year
+        Genre           = 'Documentary; Lecture'
+        Producer        = 'Microsoft'
+        PromotionUrl    = $OriginalVideoUrl
+    }
+}
+
+function Set-VideoMetadata {
+    param(
+        [parameter(Mandatory = $true)][string]$File,
+        [parameter(Mandatory = $true)][object]$Metadata
+    )
+
+    if (-not (Test-Path -LiteralPath $script:FFMPEG)) {
+        Write-Warning ('Unable to write video metadata for {0}: ffmpeg.exe was not found at {1}' -f $File, $script:FFMPEG)
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $File)) {
+        Write-Warning ('Unable to write video metadata because file was not found: {0}' -f $File)
+        return
+    }
+
+    $outputFile = '{0}.{1}.metadata{2}' -f [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($File), [System.IO.Path]::GetFileNameWithoutExtension($File)), (New-Guid).Guid, [System.IO.Path]::GetExtension($File)
+    $arguments = @('-y', '-i', $File, '-map', '0', '-c', 'copy', '-movflags', 'use_metadata_tags')
+
+    $metadataMap = [ordered]@{
+        title         = $Metadata.Title
+        subtitle      = $Metadata.Subtitle
+        artist        = $Metadata.Artists
+        album_artist  = $Metadata.Artists
+        date          = $Metadata.Year
+        year          = $Metadata.Year
+        genre         = $Metadata.Genre
+        producer      = $Metadata.Producer
+        publisher     = $Metadata.Producer
+        comment       = $Metadata.Comments
+        description   = $Metadata.Comments
+        tags          = $Metadata.Tags
+        keywords      = $Metadata.Tags
+        purl          = $Metadata.PromotionUrl
+        promotion_url = $Metadata.PromotionUrl
+        url           = $Metadata.PromotionUrl
+    }
+
+    foreach ($metadataItem in $metadataMap.GetEnumerator()) {
+        if ($null -ne $metadataItem.Value -and -not [string]::IsNullOrWhiteSpace([string]$metadataItem.Value)) {
+            $arguments += '-metadata'
+            $arguments += ('{0}={1}' -f $metadataItem.Key, $metadataItem.Value)
+        }
+    }
+
+    $arguments += $outputFile
+
+    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+    $pinfo.FileName = $script:FFMPEG
+    $pinfo.RedirectStandardError = $true
+    $pinfo.RedirectStandardOutput = $true
+    $pinfo.UseShellExecute = $false
+    $pinfo.CreateNoWindow = $true
+    $pinfo.Arguments = ($arguments | ForEach-Object { ConvertTo-ArgumentString $_ }) -join ' '
+
+    Write-Verbose ('Writing video metadata to {0}' -f $File)
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $pinfo
+    $process.Start() | Out-Null
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+
+    if ($process.ExitCode -eq 0 -and (Test-Path -LiteralPath $outputFile) -and (Get-Item -LiteralPath $outputFile).Length -gt 0) {
+        Move-Item -LiteralPath $outputFile -Destination $File -Force
+        Write-Verbose ('Video metadata written to {0}' -f $File)
+    }
+    else {
+        Remove-Item -LiteralPath $outputFile -Force -ErrorAction SilentlyContinue
+        Write-Warning ('Unable to write video metadata for {0}: {1}' -f $File, (($stderr, $stdout | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [System.Environment]::NewLine))
+    }
+}
+
 function Get-IEProxy {
     if ( (Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings').ProxyEnable -ne 0) {
         $proxies = (Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings').proxyServer
@@ -4372,6 +4618,10 @@ function Get-BackgroundDownloadJobs {
                 }
 
                 if ( $job.Type -eq 2) {
+                    if ($job.metadata) {
+                        Set-VideoMetadata -File $job.file -Metadata $job.metadata
+                    }
+
                     # Clean video leftovers
                     Clean-VideoLeftovers $job.file
                 }
@@ -4547,6 +4797,7 @@ function Add-BackgroundDownloadJob {
         $Timestamp = $null,
         $Title = '',
         $ScheduleCode = '',
+        $Metadata = $null,
         [hashtable]$Headers = $null,
         [uri]$Proxy = $null
     )
@@ -4663,6 +4914,7 @@ function Add-BackgroundDownloadJob {
         url            = $DownloadUrl
         scheduleCode   = $ScheduleCode
         timestamp      = $timestamp
+        metadata       = $Metadata
         stdOutTempFile = $stdOutTempFile
         stdErrTempFile = $stdErrTempFile
         totalBytes     = $totalBytes
@@ -5839,7 +6091,10 @@ foreach ($SessionToGet in $SessionsToGet) {
                         }
 
                         Write-Verbose ('Running: {0} {1}' -f $YouTubeEXE, ($Arg -join ' '))
-                        Add-BackgroundDownloadJob -Type 2 -FilePath $YouTubeDL -ArgumentList $Arg -File $vidFullFile -Timestamp $SessionTime -scheduleCode ($SessionToGet.sessioncode) -Title ($SessionToGet.Title)
+                        $videoMetadataOriginalUrl = Get-SessionOriginalVideoUrl -Session $SessionToGet -EventName $EventName -FallbackVideoUrl $downloadLink
+                        $videoMetadataPresentationUrl = Get-SessionPresentationUrl -Session $SessionToGet -FallbackSlidedeckUrl $SlidedeckUrl
+                        $videoMetadata = New-EventSessionVideoMetadata -Session $SessionToGet -EventName $EventName -OriginalVideoUrl $videoMetadataOriginalUrl -PresentationUrl $videoMetadataPresentationUrl
+                        Add-BackgroundDownloadJob -Type 2 -FilePath $YouTubeDL -ArgumentList $Arg -File $vidFullFile -Timestamp $SessionTime -scheduleCode ($SessionToGet.sessioncode) -Title ($SessionToGet.Title) -Metadata $videoMetadata
                     }
                     else {
                         # Video not available or no link found
