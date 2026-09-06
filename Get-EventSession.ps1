@@ -223,6 +223,12 @@
     Tells script to change the timestamp of the downloaded media files to match the original
     session timestamp, when available.
 
+    .PARAMETER UseSessionFolders
+    Stores the content of each session in its own subfolder of the download folder, instead of
+    saving everything directly in the download folder. The subfolder is named after the session,
+    matching the name used for the video file, and receives all artifacts of that session such
+    as the video, slidedeck and caption files. Session folders that end up empty are removed.
+
     .PARAMETER Locale
     When supported by the event, filters sessions on localization.
     Currently supported: de-DE, zh-CN, en-US, ja-JP, es-CO, fr-FR.
@@ -4665,6 +4671,37 @@ function Get-ExistingCaptionFile {
     return $null
 }
 
+function Remove-EmptySessionFolder {
+    # Removes a per-session folder that ended up without any content. Downloads are queued as
+    # background jobs, so a folder can still look empty while a job is about to write into it;
+    # those folders are kept so the download does not lose its target directory.
+    param(
+        [parameter(Mandatory = $true)][string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    if (@(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue).Count -gt 0) {
+        return
+    }
+
+    foreach ($pendingJob in $script:BackgroundDownloadJobs) {
+        $pendingFile = [string]$pendingJob.file
+        if ([string]::IsNullOrWhiteSpace($pendingFile)) {
+            continue
+        }
+        if ([System.IO.Path]::GetDirectoryName($pendingFile) -eq $Path) {
+            Write-Verbose ('Keeping session folder {0}: a download job still targets it' -f $Path)
+            return
+        }
+    }
+
+    Write-Verbose ('Removing empty session folder {0}' -f $Path)
+    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+}
+
 function Clean-VideoLeftovers ( $videofile) {
     $masks = '.*.mp4.part', '.*.mp4.ytdl'
     foreach ( $mask in $masks) {
@@ -5954,6 +5991,8 @@ else {
 foreach ($SessionToGet in $SessionsToGet) {
 
     $i++
+    # Reset per-session state so a skipped session cannot act on the previous session's folder
+    $ContentTargetFolder = $null
     $ProgressPercent = if ( $SessionsSelected -gt 0 ) { ($i / $SessionsSelected * 100) } else { 0 }
     Write-Progress -Id 1 -Activity 'Inspecting session information' -Status "Processing session $i of $SessionsSelected" -PercentComplete $ProgressPercent
     if ( $SessionToGet.sessionCode) {
@@ -5984,7 +6023,7 @@ foreach ($SessionToGet in $SessionsToGet) {
         # When storing session content in subfolders per session, override the content target folder to be the session subfolder
         if ( $UseSessionFolders) {
             $SessionFolder = Join-Path -Path $DownloadFolder -ChildPath $FileName
-            if ( (Test-Path $SessionFolder) -eq $false ) {
+            if ( (Test-Path -LiteralPath $SessionFolder) -eq $false ) {
                 New-Item -Path $SessionFolder -ItemType Directory | Out-Null
             }
             $ContentTargetFolder = $SessionFolder
@@ -6509,8 +6548,8 @@ foreach ($SessionToGet in $SessionsToGet) {
     }
 
     # Clear empty per-session folder
-    if ($UseSessionFolders -and -not (Get-ChildItem -Path $ContentTargetFolder)) {
-        Remove-Item -Path $ContentTargetFolder -Force
+    if ($UseSessionFolders -and -not [string]::IsNullOrWhiteSpace([string]$ContentTargetFolder)) {
+        Remove-EmptySessionFolder -Path $ContentTargetFolder
     }
 
 }
