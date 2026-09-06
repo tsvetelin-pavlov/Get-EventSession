@@ -628,12 +628,73 @@ function Get-SessionOriginalVideoUrl {
     return $FallbackVideoUrl
 }
 
+function Get-SessionRepositoryUrl {
+    param(
+        [parameter(Mandatory = $true)][object]$Session
+    )
+
+    # GitHub paths that look like owner/repo but are product or marketing pages
+    $nonRepositoryOwners = @('about', 'apps', 'collections', 'customer-stories', 'enterprise', 'events', 'explore', 'features', 'login', 'marketplace', 'organizations', 'orgs', 'pricing', 'readme', 'resources', 'security', 'settings', 'solutions', 'sponsors', 'team', 'topics', 'trending')
+
+    $candidates = [System.Collections.ArrayList]@()
+    foreach ($propertyName in @('relatedResources', 'nextStep', 'sessionLinks')) {
+        if ($Session.PSObject.Properties.Match($propertyName).Count -eq 0) {
+            continue
+        }
+
+        foreach ($resource in @($Session.$propertyName)) {
+            if ($null -eq $resource) {
+                continue
+            }
+
+            if ($resource -is [string]) {
+                $link = $resource
+                $category = ''
+            }
+            else {
+                $link = Get-ObjectPropertyValue -Object $resource -Name @('link', 'url', 'linkUrl')
+                $category = [string](Get-ObjectPropertyValue -Object $resource -Name @('category'))
+            }
+
+            if ($link) {
+                $candidates.Add([PSCustomObject]@{ Url = [string]$link; IsCodeSample = ($category -match '(?i)code') }) | Out-Null
+            }
+        }
+    }
+
+    $description = Get-ObjectPropertyValue -Object $Session -Name @('description', 'aiDescription')
+    if ($description) {
+        foreach ($match in [regex]::Matches([string]$description, '(?i)https://github\.com/[^\s<>"'')\]]+')) {
+            $candidates.Add([PSCustomObject]@{ Url = $match.Value; IsCodeSample = $false }) | Out-Null
+        }
+    }
+
+    # Prefer links explicitly published as code samples, keeping catalog order otherwise
+    $orderedCandidates = @($candidates | Where-Object { $_.IsCodeSample }) + @($candidates | Where-Object { -not $_.IsCodeSample })
+
+    foreach ($candidate in $orderedCandidates) {
+        $url = (($candidate.Url -split '[?#]')[0]).TrimEnd('.', ',', ')', '/')
+        if ($url -notmatch '(?i)^https://github\.com/(?<owner>[A-Za-z0-9][A-Za-z0-9-]*)/(?<repo>[A-Za-z0-9_.-]+)$') {
+            continue
+        }
+
+        if ($nonRepositoryOwners -contains $Matches.owner.ToLowerInvariant()) {
+            continue
+        }
+
+        return 'https://github.com/{0}/{1}' -f $Matches.owner, $Matches.repo
+    }
+
+    return $null
+}
+
 function New-EventSessionVideoMetadata {
     param(
         [parameter(Mandatory = $true)][object]$Session,
         [AllowNull()][string]$EventName,
         [AllowNull()][string]$OriginalVideoUrl,
-        [AllowNull()][string]$PresentationUrl
+        [AllowNull()][string]$PresentationUrl,
+        [AllowNull()][string]$RepositoryUrl
     )
 
     $description = Get-ObjectPropertyValue -Object $Session -Name @('description', 'aiDescription')
@@ -662,11 +723,14 @@ function New-EventSessionVideoMetadata {
         $commentLines.Add(([string]$description).Trim()) | Out-Null
         $commentLines.Add('') | Out-Null
     }
-    if ($OriginalVideoUrl) {
-        $commentLines.Add(('Original video: {0}' -f $OriginalVideoUrl)) | Out-Null
-    }
     if ($PresentationUrl) {
         $commentLines.Add(('Presentation: {0}' -f $PresentationUrl)) | Out-Null
+    }
+    if ($RepositoryUrl) {
+        $commentLines.Add(('GitHub repository: {0}' -f $RepositoryUrl)) | Out-Null
+    }
+    if ($OriginalVideoUrl) {
+        $commentLines.Add(('Original video: {0}' -f $OriginalVideoUrl)) | Out-Null
     }
 
     return [PSCustomObject]@{
@@ -6093,7 +6157,8 @@ foreach ($SessionToGet in $SessionsToGet) {
                         Write-Verbose ('Running: {0} {1}' -f $YouTubeEXE, ($Arg -join ' '))
                         $videoMetadataOriginalUrl = Get-SessionOriginalVideoUrl -Session $SessionToGet -EventName $EventName -FallbackVideoUrl $downloadLink
                         $videoMetadataPresentationUrl = Get-SessionPresentationUrl -Session $SessionToGet -FallbackSlidedeckUrl $SlidedeckUrl
-                        $videoMetadata = New-EventSessionVideoMetadata -Session $SessionToGet -EventName $EventName -OriginalVideoUrl $videoMetadataOriginalUrl -PresentationUrl $videoMetadataPresentationUrl
+                        $videoMetadataRepositoryUrl = Get-SessionRepositoryUrl -Session $SessionToGet
+                        $videoMetadata = New-EventSessionVideoMetadata -Session $SessionToGet -EventName $EventName -OriginalVideoUrl $videoMetadataOriginalUrl -PresentationUrl $videoMetadataPresentationUrl -RepositoryUrl $videoMetadataRepositoryUrl
                         Add-BackgroundDownloadJob -Type 2 -FilePath $YouTubeDL -ArgumentList $Arg -File $vidFullFile -Timestamp $SessionTime -scheduleCode ($SessionToGet.sessioncode) -Title ($SessionToGet.Title) -Metadata $videoMetadata
                     }
                     else {
